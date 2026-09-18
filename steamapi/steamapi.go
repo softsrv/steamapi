@@ -259,3 +259,50 @@ func (s *Client) Friends(ctx context.Context, steamID string) ([]Player, error) 
 	}
 	return playerFriendsList, nil
 }
+
+// SharedGames accepts one or more steamIDs and returns the games owned by all of them.
+func (s *Client) SharedGames(ctx context.Context, steamIDs []string) ([]Game, error) {
+	if len(steamIDs) == 0 {
+		return nil, fmt.Errorf("must provide at least one steamID")
+	}
+
+	firstGames, err := s.Games(ctx, steamIDs[0])
+	if err != nil {
+		return nil, err
+	}
+	if len(steamIDs) == 1 {
+		return firstGames, nil
+	}
+
+	sharedGamesByAppID := make(map[int]Game)
+	for _, game := range firstGames {
+		sharedGamesByAppID[game.AppID] = game
+	}
+
+	for _, steamID := range steamIDs[1:] {
+		games, err := s.Games(ctx, steamID)
+		if err != nil {
+			return nil, err
+		}
+
+		ownedGamesByAppID := make(map[int]bool)
+		for _, game := range games {
+			ownedGamesByAppID[game.AppID] = true
+		}
+
+		for appID := range sharedGamesByAppID {
+			if !ownedGamesByAppID[appID] {
+				delete(sharedGamesByAppID, appID)
+			}
+		}
+	}
+
+	sharedGames := []Game{}
+	for _, game := range firstGames {
+		if _, ok := sharedGamesByAppID[game.AppID]; ok {
+			sharedGames = append(sharedGames, game)
+		}
+	}
+
+	return sharedGames, nil
+}
