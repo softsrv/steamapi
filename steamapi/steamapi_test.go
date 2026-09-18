@@ -159,6 +159,51 @@ func TestSharedGamesConcurrentFetch(t *testing.T) {
 	}
 }
 
+func TestSharedGamesErrorIsLowestIndexOnMultipleFailures(t *testing.T) {
+	threeFailed := make(chan struct{})
+	var signalThreeFailed sync.Once
+
+	client := NewClient("test-key")
+	client.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		steamID := req.URL.Query().Get("steamid")
+		switch steamID {
+		case "one":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"response":{"games":[{"appid":10,"name":"First Shared"}]}}`)),
+				Header:     make(http.Header),
+			}, nil
+		case "two":
+			select {
+			case <-threeFailed:
+			case <-time.After(time.Second):
+				return nil, fmt.Errorf("timed out waiting for higher-index failure")
+			}
+			return nil, fmt.Errorf("games failed for two lowest-index failure")
+		case "three":
+			signalThreeFailed.Do(func() { close(threeFailed) })
+			return nil, fmt.Errorf("games failed for three higher-index failure")
+		default:
+			t.Fatalf("unexpected steamID %q", steamID)
+			return nil, nil
+		}
+	})}
+
+	games, err := client.SharedGames(context.Background(), []string{"one", "two", "three"})
+	if err == nil {
+		t.Fatalf("expected Games error to be returned")
+	}
+	if games != nil {
+		t.Fatalf("expected nil games on Games error, got %#v", games)
+	}
+	if !strings.Contains(err.Error(), "two lowest-index failure") {
+		t.Fatalf("expected lowest-index failure from steamID two, got %v", err)
+	}
+	if strings.Contains(err.Error(), "three higher-index failure") {
+		t.Fatalf("expected lower-index error despite higher-index failure completing first, got %v", err)
+	}
+}
+
 func TestSharedGamesHandlesSingleEmptyAndErrors(t *testing.T) {
 	calls := 0
 	var callsMu sync.Mutex
