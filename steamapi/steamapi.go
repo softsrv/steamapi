@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 )
 
 const baseURL = "https://api.steampowered.com"
@@ -266,10 +267,29 @@ func (s *Client) SharedGames(ctx context.Context, steamIDs []string) ([]Game, er
 		return nil, fmt.Errorf("must provide at least one steamID")
 	}
 
-	firstGames, err := s.Games(ctx, steamIDs[0])
-	if err != nil {
-		return nil, err
+	type gamesResult struct {
+		games []Game
+		err   error
 	}
+
+	results := make([]gamesResult, len(steamIDs))
+	var wg sync.WaitGroup
+	wg.Add(len(steamIDs))
+	for i, steamID := range steamIDs {
+		go func(i int, steamID string) {
+			defer wg.Done()
+			results[i].games, results[i].err = s.Games(ctx, steamID)
+		}(i, steamID)
+	}
+	wg.Wait()
+
+	for _, result := range results {
+		if result.err != nil {
+			return nil, result.err
+		}
+	}
+
+	firstGames := results[0].games
 	if len(steamIDs) == 1 {
 		return firstGames, nil
 	}
@@ -279,14 +299,9 @@ func (s *Client) SharedGames(ctx context.Context, steamIDs []string) ([]Game, er
 		sharedGamesByAppID[game.AppID] = game
 	}
 
-	for _, steamID := range steamIDs[1:] {
-		games, err := s.Games(ctx, steamID)
-		if err != nil {
-			return nil, err
-		}
-
+	for _, result := range results[1:] {
 		ownedGamesByAppID := make(map[int]bool)
-		for _, game := range games {
+		for _, game := range result.games {
 			ownedGamesByAppID[game.AppID] = true
 		}
 
