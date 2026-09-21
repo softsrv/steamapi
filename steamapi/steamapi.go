@@ -10,7 +10,8 @@ import (
 	"strings"
 )
 
-const baseURL = "https://api.steampowered.com"
+// baseURL is a var (not const) so tests can point it at a mock server.
+var baseURL = "https://api.steampowered.com"
 const userService = "ISteamUser"
 const playerService = "IPlayerService"
 
@@ -173,6 +174,10 @@ func (s *Client) Player(ctx context.Context, steamID string) (Player, error) {
 		fmt.Println("got an error decoding the http response body")
 		fmt.Printf("the err is: %s\n", err)
 		return Player{}, err
+	}
+
+	if len(parsedPlayers.Response.Players) == 0 {
+		return Player{}, fmt.Errorf("no player found for steamid %s", steamID)
 	}
 	playerResult := parsedPlayers.Response.Players[0]
 
