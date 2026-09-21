@@ -70,8 +70,22 @@ type FriendsResult struct {
 
 // Client is the type that owns methods for fetching steam data
 type Client struct {
-	client *http.Client
-	apiKey string
+	client  *http.Client
+	apiKey  string
+	gamesFn func(ctx context.Context, steamID string) ([]Game, error)
+}
+
+// NoGamesError is returned when one or more users have no owned games.
+type NoGamesError struct {
+	SteamIDs []string
+}
+
+// Error returns a descriptive error string containing the empty users' Steam IDs.
+func (e *NoGamesError) Error() string {
+	if e == nil {
+		return "no games"
+	}
+	return fmt.Sprintf("no games found for Steam IDs: %s", strings.Join(e.SteamIDs, ", "))
 }
 
 // NewClient returns a client struct configured with the provided Steam web API Key
@@ -206,6 +220,56 @@ func (s *Client) Games(ctx context.Context, steamID string) ([]Game, error) {
 	gamesResult := parsedGames.Response.Games
 
 	return gamesResult, nil
+}
+
+// SharedGames returns the games owned by every provided Steam ID.
+func (s *Client) SharedGames(ctx context.Context, callerID string, otherIDs ...string) ([]Game, error) {
+	steamIDs := append([]string{callerID}, otherIDs...)
+
+	gamesByUser := make([][]Game, 0, len(steamIDs))
+	fetchGames := s.gamesFn
+	if fetchGames == nil {
+		fetchGames = s.Games
+	}
+
+	for _, steamID := range steamIDs {
+		games, err := fetchGames(ctx, steamID)
+		if err != nil {
+			return nil, err
+		}
+		gamesByUser = append(gamesByUser, games)
+	}
+
+	var emptySteamIDs []string
+	for i, games := range gamesByUser {
+		if len(games) == 0 {
+			emptySteamIDs = append(emptySteamIDs, steamIDs[i])
+		}
+	}
+	if len(emptySteamIDs) > 0 {
+		return nil, &NoGamesError{SteamIDs: emptySteamIDs}
+	}
+
+	ownedCounts := make(map[int]int)
+	for _, games := range gamesByUser {
+		seen := make(map[int]bool)
+		for _, game := range games {
+			if seen[game.AppID] {
+				continue
+			}
+			seen[game.AppID] = true
+			ownedCounts[game.AppID]++
+		}
+	}
+
+	sharedGames := make([]Game, 0)
+	for _, game := range gamesByUser[0] {
+		if ownedCounts[game.AppID] == len(gamesByUser) {
+			sharedGames = append(sharedGames, game)
+		}
+	}
+
+	return sharedGames, nil
 }
 
 // Friends accepts a steamID and returns all friends for that ID as a slice of Player
