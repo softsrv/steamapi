@@ -12,16 +12,33 @@ import (
 
 // baseURL is a var (not const) so tests can point it at a mock server.
 var baseURL = "https://api.steampowered.com"
+
 const userService = "ISteamUser"
 const playerService = "IPlayerService"
+const newsService = "ISteamNews"
+const userStatsService = "ISteamUserStats"
 
 // Player contains details about the Steam User
 type Player struct {
-	SteamID      string `json:"steamid"`
-	PersonaName  string `json:"personaname"`
-	AvatarSmall  string `json:"avatar"`
-	AvatarMedium string `json:"avatarmedium"`
-	AvatarFull   string `json:"avatarfull"`
+	SteamID                  string `json:"steamid"`
+	PersonaName              string `json:"personaname"`
+	AvatarSmall              string `json:"avatar"`
+	AvatarMedium             string `json:"avatarmedium"`
+	AvatarFull               string `json:"avatarfull"`
+	CommunityVisibilityState int    `json:"communityvisibilitystate"`
+	ProfileState             int    `json:"profilestate"`
+	LastLogoff               int    `json:"lastlogoff"`
+	PersonaState             int    `json:"personastate"`
+	RealName                 string `json:"realname"`
+	PrimaryClanID            string `json:"primaryclanid"`
+	TimeCreated              int    `json:"timecreated"`
+	PersonaStateFlags        int    `json:"personastateflags"`
+	GameID                   string `json:"gameid"`
+	GameExtraInfo            string `json:"gameextrainfo"`
+	LocCountryCode           string `json:"loccountrycode"`
+	LocStateCode             string `json:"locstatecode"`
+	LocCityID                int    `json:"loccityid"`
+	ProfileURL               string `json:"profileurl"`
 }
 
 // PlayersList contains a slice of Player objects.
@@ -36,11 +53,17 @@ type PlayersResult struct {
 
 // Game contains details about a Steam game
 type Game struct {
-	AppID           int    `json:"appid"`
-	Name            string `json:"name"`
-	PlaytimeForever int    `json:"playtime_forever"`
-	ImgIconURL      string `json:"img_icon_url"`
-	ImgLogoURL      string `json:"img_logo_url"`
+	AppID                    int    `json:"appid"`
+	Name                     string `json:"name"`
+	PlaytimeForever          int    `json:"playtime_forever"`
+	ImgIconURL               string `json:"img_icon_url"`
+	ImgLogoURL               string `json:"img_logo_url"`
+	Playtime2Weeks           int    `json:"playtime_2weeks"`
+	HasCommunityVisibleStats bool   `json:"has_community_visible_stats"`
+	PlaytimeWindowsForever   int    `json:"playtime_windows_forever"`
+	PlaytimeMacForever       int    `json:"playtime_mac_forever"`
+	PlaytimeLinuxForever     int    `json:"playtime_linux_forever"`
+	RTimeLastPlayed          int    `json:"rtime_last_played"`
 }
 
 // GamesList contains a slice of Game objects
@@ -55,8 +78,9 @@ type GamesResult struct {
 
 // A Friend is a reference to a Player who is friends with a particular user
 type Friend struct {
-	SteamID     string `json:"steamid"`
-	FriendSince int    `json:"friend_since"`
+	SteamID      string `json:"steamid"`
+	FriendSince  int    `json:"friend_since"`
+	Relationship string `json:"relationship"`
 }
 
 // FriendsList contains an array of Friend objects
@@ -64,7 +88,7 @@ type FriendsList struct {
 	Friends []Friend `json:"friends"`
 }
 
-// FriendsResult contains a "friendslist"" object with relevant data
+// FriendsResult contains a "friendslist" object with relevant data
 type FriendsResult struct {
 	FriendsList FriendsList `json:"friendslist"`
 }
@@ -97,134 +121,63 @@ func NewClient(apiKey string) *Client {
 	}
 }
 
-// Players accepts one or more steamIDs and returns a slice of Player
-func (s *Client) Players(ctx context.Context, steamIDs []string) ([]Player, error) {
-
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		fmt.Sprintf("%s/%s/GetPlayerSummaries/v0002?%s", baseURL, userService, url.Values{
-			"steamids": {strings.Join(steamIDs, ",")},
-			"key":      {s.apiKey},
-		}.Encode()),
-		nil,
-	)
+// doGet builds, sends, and decodes every Steam API request.
+func doGet[T any](ctx context.Context, s *Client, service, endpoint string, params url.Values) (T, error) {
+	var zero T
+	params.Set("key", s.apiKey)
+	reqURL := fmt.Sprintf("%s/%s/%s?%s", baseURL, service, endpoint, params.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		fmt.Println("got an error forming the request")
-		return nil, err
+		return zero, fmt.Errorf("steamapi: building request: %w", err)
 	}
-
-	req.Header.Add("Content-Type", "application/json")
-
+	req.Header.Set("Content-Type", "application/json")
 	res, err := s.client.Do(req)
-	if res != nil {
-		fmt.Println("got a response, so defering the body close")
-		defer res.Body.Close()
-	}
-
 	if err != nil {
-		fmt.Println("got an error on .Do of http request")
-		return nil, err
+		return zero, fmt.Errorf("steamapi: performing request: %w", err)
 	}
-
-	parsedPlayers := PlayersResult{}
-	if err := json.NewDecoder(res.Body).Decode(&parsedPlayers); err != nil {
-		fmt.Println("got an error decoding the http response body")
-		fmt.Printf("the err is: %s\n", err)
-		return nil, err
+	defer res.Body.Close()
+	var out T
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return zero, fmt.Errorf("steamapi: decoding response: %w", err)
 	}
-
-	return parsedPlayers.Response.Players, nil
+	return out, nil
 }
 
-// Player accepts one steamID and returns that player's object
+// Players accepts one or more steamIDs and returns a slice of Player.
+func (s *Client) Players(ctx context.Context, steamIDs []string) ([]Player, error) {
+	result, err := doGet[PlayersResult](ctx, s, userService, "GetPlayerSummaries/v0002", url.Values{
+		"steamids": {strings.Join(steamIDs, ",")},
+	})
+	return result.Response.Players, err
+}
+
+// Player accepts one steamID and returns that player's object.
 func (s *Client) Player(ctx context.Context, steamID string) (Player, error) {
-
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		baseURL+"/"+userService+"/GetPlayerSummaries/v0002?"+url.Values{
-			"steamids": {steamID},
-			"key":      {s.apiKey},
-		}.Encode(),
-		nil,
-	)
+	players, err := s.Players(ctx, []string{steamID})
 	if err != nil {
-		fmt.Println("got an error forming the request")
 		return Player{}, err
 	}
-
-	req.Header.Add("Content-Type", "application/json")
-
-	res, err := s.client.Do(req)
-	if res != nil {
-		fmt.Println("got a response, so defering the body close")
-		defer res.Body.Close()
-	}
-
-	if err != nil {
-		fmt.Println("got an error on .Do of http request")
-		return Player{}, err
-	}
-
-	parsedPlayers := PlayersResult{}
-	// data, _ := ioutil.ReadAll(res.Body)
-	// fmt.Println(string(data))
-	if err := json.NewDecoder(res.Body).Decode(&parsedPlayers); err != nil {
-		fmt.Println("got an error decoding the http response body")
-		fmt.Printf("the err is: %s\n", err)
-		return Player{}, err
-	}
-
-	if len(parsedPlayers.Response.Players) == 0 {
+	if len(players) == 0 {
 		return Player{}, fmt.Errorf("no player found for steamid %s", steamID)
 	}
-	playerResult := parsedPlayers.Response.Players[0]
-
-	return playerResult, nil
+	return players[0], nil
 }
 
-// Games accepts one steamID and returns a slice of Game
-func (s *Client) Games(ctx context.Context, steamID string) ([]Game, error) {
-
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		baseURL+"/"+playerService+"/GetOwnedGames/v0001/?"+url.Values{
-			"steamid":                   {steamID},
-			"key":                       {s.apiKey},
-			"include_appinfo":           {"1"},
-			"include_played_free_games": {"1"},
-		}.Encode(),
-		nil,
-	)
-	if err != nil {
-		fmt.Println("got an error forming the request")
-		return nil, err
+// Games returns owned games with caller-controlled app info and free-game inclusion.
+func (s *Client) Games(ctx context.Context, steamID string, includeAppInfo, includePlayedFreeGames bool) ([]Game, error) {
+	appInfo, freeGames := "0", "0"
+	if includeAppInfo {
+		appInfo = "1"
 	}
-
-	req.Header.Add("Content-Type", "application/json")
-
-	res, err := s.client.Do(req)
-	if res != nil {
-		fmt.Println("got a response, so defering the body close")
-		defer res.Body.Close()
+	if includePlayedFreeGames {
+		freeGames = "1"
 	}
-
-	if err != nil {
-		fmt.Println("got an error on .Do of http request")
-		return nil, err
-	}
-
-	parsedGames := GamesResult{}
-
-	if err := json.NewDecoder(res.Body).Decode(&parsedGames); err != nil {
-		fmt.Println("got an error decoding the http response body")
-		return nil, err
-	}
-	gamesResult := parsedGames.Response.Games
-
-	return gamesResult, nil
+	result, err := doGet[GamesResult](ctx, s, playerService, "GetOwnedGames/v0001/", url.Values{
+		"steamid":                   {steamID},
+		"include_appinfo":           {appInfo},
+		"include_played_free_games": {freeGames},
+	})
+	return result.Response.Games, err
 }
 
 // SharedGames returns the games owned by every provided Steam ID.
@@ -234,7 +187,9 @@ func (s *Client) SharedGames(ctx context.Context, callerID string, otherIDs ...s
 	gamesByUser := make([][]Game, 0, len(steamIDs))
 	fetchGames := s.gamesFn
 	if fetchGames == nil {
-		fetchGames = s.Games
+		fetchGames = func(ctx context.Context, steamID string) ([]Game, error) {
+			return s.Games(ctx, steamID, true, true)
+		}
 	}
 
 	for _, steamID := range steamIDs {
@@ -277,54 +232,125 @@ func (s *Client) SharedGames(ctx context.Context, callerID string, otherIDs ...s
 	return sharedGames, nil
 }
 
-// Friends accepts a steamID and returns all friends for that ID as a slice of Player
-func (s *Client) Friends(ctx context.Context, steamID string) ([]Player, error) {
+// Friends returns the raw friend list without fetching player summaries.
+func (s *Client) Friends(ctx context.Context, steamID string) ([]Friend, error) {
+	result, err := doGet[FriendsResult](ctx, s, userService, "GetFriendList/v0001/", url.Values{
+		"steamid":      {steamID},
+		"relationship": {"friend"},
+	})
+	return result.FriendsList.Friends, err
+}
 
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		baseURL+"/"+userService+"/GetFriendList/v0001/?"+url.Values{
-			"steamid":      {steamID},
-			"key":          {s.apiKey},
-			"relationship": {"friend"},
-		}.Encode(),
-		nil,
-	)
-	if err != nil {
-		fmt.Println("got an error forming the request")
-		return nil, err
-	}
+// NewsItem contains a Steam news article for an app.
+type NewsItem struct {
+	GID           string `json:"gid"`
+	Title         string `json:"title"`
+	URL           string `json:"url"`
+	IsExternalURL bool   `json:"is_external_url"`
+	Author        string `json:"author"`
+	Contents      string `json:"contents"`
+	FeedLabel     string `json:"feedlabel"`
+	Date          int    `json:"date"`
+	FeedName      string `json:"feedname"`
+	FeedType      int    `json:"feed_type"`
+	AppID         int    `json:"appid"`
+}
 
-	req.Header.Add("Content-Type", "application/json")
+// AppNews contains the news items and their app's metadata.
+type AppNews struct {
+	AppID     int        `json:"appid"`
+	NewsItems []NewsItem `json:"newsitems"`
+	Count     int        `json:"count"`
+}
 
-	res, err := s.client.Do(req)
-	if res != nil {
-		fmt.Println("got a response, so defering the body close")
-		defer res.Body.Close()
-	}
+// NewsResult contains the GetNewsForApp response envelope.
+type NewsResult struct {
+	AppNews AppNews `json:"appnews"`
+}
 
-	if err != nil {
-		fmt.Println("got an error on .Do of http request")
-		return nil, err
-	}
+// GlobalAchievement contains an achievement's global completion percentage.
+type GlobalAchievement struct {
+	Name    string  `json:"name"`
+	Percent float64 `json:"percent"`
+}
 
-	parsedFriends := FriendsResult{}
+// GlobalAchievementsList contains global achievement percentages.
+type GlobalAchievementsList struct {
+	Achievements []GlobalAchievement `json:"achievements"`
+}
 
-	if err := json.NewDecoder(res.Body).Decode(&parsedFriends); err != nil {
-		fmt.Println("got an error decoding the http response body")
-		return nil, err
-	}
+// GlobalAchievementsResult contains the global achievement response envelope.
+type GlobalAchievementsResult struct {
+	AchievementPercentages GlobalAchievementsList `json:"achievementpercentages"`
+}
 
-	friendsResult := parsedFriends.FriendsList.Friends
+// PlayerAchievement contains a player's achievement and optional localized text.
+type PlayerAchievement struct {
+	APIName     string `json:"apiname"`
+	Achieved    int    `json:"achieved"`
+	UnlockTime  int    `json:"unlocktime"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+}
 
-	var idList []string
-	for _, friend := range friendsResult {
-		idList = append(idList, friend.SteamID)
-	}
+// UserStat contains a player's named integer statistic.
+type UserStat struct {
+	Name  string `json:"name"`
+	Value int    `json:"value"`
+}
 
-	playerFriendsList, err := s.Players(ctx, idList)
-	if err != nil {
-		return nil, err
-	}
-	return playerFriendsList, nil
+// PlayerStats contains a player's statistics and achievements for one game.
+type PlayerStats struct {
+	SteamID      string              `json:"steamID"`
+	GameName     string              `json:"gameName"`
+	Stats        []UserStat          `json:"stats"`
+	Achievements []PlayerAchievement `json:"achievements"`
+	Success      bool                `json:"success"`
+}
+
+// PlayerStatsResult contains the player statistics response envelope.
+type PlayerStatsResult struct {
+	PlayerStats PlayerStats `json:"playerstats"`
+}
+
+// GetNewsForApp returns the news items for an app.
+func (s *Client) GetNewsForApp(ctx context.Context, appid string) ([]NewsItem, error) {
+	result, err := doGet[NewsResult](ctx, s, newsService, "GetNewsForApp/v0002", url.Values{
+		"appid": {appid},
+	})
+	return result.AppNews.NewsItems, err
+}
+
+// GetGlobalAchievementPercentagesForApp returns global achievement completion percentages.
+func (s *Client) GetGlobalAchievementPercentagesForApp(ctx context.Context, appid string) ([]GlobalAchievement, error) {
+	result, err := doGet[GlobalAchievementsResult](ctx, s, userStatsService, "GetGlobalAchievementPercentagesForApp/v0002", url.Values{
+		"gameid": {appid},
+	})
+	return result.AchievementPercentages.Achievements, err
+}
+
+// GetPlayerAchievements returns a player's achievements for an app.
+func (s *Client) GetPlayerAchievements(ctx context.Context, steamID, appid string) ([]PlayerAchievement, error) {
+	result, err := doGet[PlayerStatsResult](ctx, s, userStatsService, "GetPlayerAchievements/v0001", url.Values{
+		"steamid": {steamID},
+		"appid":   {appid},
+	})
+	return result.PlayerStats.Achievements, err
+}
+
+// GetUserStatsForGame returns a player's statistics for an app.
+func (s *Client) GetUserStatsForGame(ctx context.Context, steamID, appid string) ([]UserStat, error) {
+	result, err := doGet[PlayerStatsResult](ctx, s, userStatsService, "GetUserStatsForGame/v0002", url.Values{
+		"steamid": {steamID},
+		"appid":   {appid},
+	})
+	return result.PlayerStats.Stats, err
+}
+
+// GetRecentlyPlayedGames returns a player's recently played games.
+func (s *Client) GetRecentlyPlayedGames(ctx context.Context, steamID string) ([]Game, error) {
+	result, err := doGet[GamesResult](ctx, s, playerService, "GetRecentlyPlayedGames/v0001", url.Values{
+		"steamid": {steamID},
+	})
+	return result.Response.Games, err
 }
