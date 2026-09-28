@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 )
 
 // baseURL is a var (not const) so tests can point it at a mock server.
@@ -184,7 +185,7 @@ func (s *Client) Games(ctx context.Context, steamID string, includeAppInfo, incl
 func (s *Client) SharedGames(ctx context.Context, callerID string, otherIDs ...string) ([]Game, error) {
 	steamIDs := append([]string{callerID}, otherIDs...)
 
-	gamesByUser := make([][]Game, 0, len(steamIDs))
+	gamesByUser := make([][]Game, len(steamIDs))
 	fetchGames := s.gamesFn
 	if fetchGames == nil {
 		fetchGames = func(ctx context.Context, steamID string) ([]Game, error) {
@@ -192,12 +193,30 @@ func (s *Client) SharedGames(ctx context.Context, callerID string, otherIDs ...s
 		}
 	}
 
-	for _, steamID := range steamIDs {
-		games, err := fetchGames(ctx, steamID)
-		if err != nil {
-			return nil, err
-		}
-		gamesByUser = append(gamesByUser, games)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	for i, steamID := range steamIDs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			games, err := fetchGames(ctx, steamID)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			gamesByUser[i] = games
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	var emptySteamIDs []string
