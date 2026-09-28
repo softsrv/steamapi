@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -377,7 +379,7 @@ func TestGames_Success(t *testing.T) {
 		})
 	}))
 
-	games, err := client.Games(context.Background(), "42")
+	games, err := client.Games(context.Background(), "42", true, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -401,7 +403,7 @@ func TestGames_DecodeError(t *testing.T) {
 		w.Write([]byte("not json"))
 	}))
 
-	_, err := client.Games(context.Background(), "42")
+	_, err := client.Games(context.Background(), "42", true, true)
 	if err == nil {
 		t.Fatal("expected an error for invalid JSON, got nil")
 	}
@@ -409,62 +411,49 @@ func TestGames_DecodeError(t *testing.T) {
 
 func TestFriends_Success(t *testing.T) {
 	mux := http.NewServeMux()
-
+	var requests atomic.Int32
 	mux.HandleFunc("/ISteamUser/GetFriendList/v0001/", func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Query().Get("steamid"); got != "1" {
-			t.Errorf("expected steamid=1, got %q", got)
-		}
-		writeJSON(t, w, FriendsResult{
-			FriendsList: FriendsList{
-				Friends: []Friend{
-					{SteamID: "2", FriendSince: 100},
-					{SteamID: "3", FriendSince: 200},
-				},
-			},
+		requests.Add(1)
+		assertRequest(t, r, "/ISteamUser/GetFriendList/v0001/", map[string]string{
+			"steamid": "1", "relationship": "friend",
 		})
+		writeJSON(t, w, json.RawMessage(`{"friendslist":{"friends":[
+			{"steamid":"2","friend_since":100,"relationship":"friend"},
+			{"steamid":"3","friend_since":200,"relationship":"friend"}
+		]}}`))
 	})
-
 	mux.HandleFunc("/ISteamUser/GetPlayerSummaries/v0002", func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Query().Get("steamids"); got != "2,3" {
-			t.Errorf("expected steamids=2,3, got %q", got)
-		}
-		writeJSON(t, w, PlayersResult{
-			Response: PlayersList{
-				Players: []Player{
-					{SteamID: "2", PersonaName: "Carol"},
-					{SteamID: "3", PersonaName: "Dave"},
-				},
-			},
-		})
+		// Fail without calling Fatal from the HTTP server's goroutine.
+		t.Error("Friends must not request player summaries")
+		http.Error(w, "unexpected hydration", http.StatusInternalServerError)
 	})
-
 	client := newTestClient(t, mux)
-
 	friends, err := client.Friends(context.Background(), "1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(friends) != 2 || friends[0].PersonaName != "Carol" || friends[1].PersonaName != "Dave" {
-		t.Errorf("unexpected friends: %+v", friends)
+	want := []Friend{
+		{SteamID: "2", FriendSince: 100, Relationship: "friend"},
+		{SteamID: "3", FriendSince: 200, Relationship: "friend"},
+	}
+	if !reflect.DeepEqual(friends, want) {
+		t.Errorf("Friends() = %#v, want %#v", friends, want)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("GetFriendList requests = %d, want 1", got)
 	}
 }
 
 func TestFriends_NoFriends(t *testing.T) {
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("/ISteamUser/GetFriendList/v0001/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, FriendsResult{})
 	})
-
 	mux.HandleFunc("/ISteamUser/GetPlayerSummaries/v0002", func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Query().Get("steamids"); got != "" {
-			t.Errorf("expected empty steamids, got %q", got)
-		}
-		writeJSON(t, w, PlayersResult{})
+		t.Error("Friends must not request player summaries for an empty list")
+		http.Error(w, "unexpected hydration", http.StatusInternalServerError)
 	})
-
 	client := newTestClient(t, mux)
-
 	friends, err := client.Friends(context.Background(), "1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -482,5 +471,524 @@ func TestFriends_DecodeError(t *testing.T) {
 	_, err := client.Friends(context.Background(), "1")
 	if err == nil {
 		t.Fatal("expected an error for invalid JSON, got nil")
+	}
+}
+
+// assertRequest checks the common helper contract as well as endpoint-specific parameters.
+func assertRequest(t *testing.T, r *http.Request, path string, params map[string]string) {
+	t.Helper()
+	if r.Method != http.MethodGet {
+		t.Errorf("method = %q, want GET", r.Method)
+	}
+	if r.URL.Path != path {
+		t.Errorf("path = %q, want %q", r.URL.Path, path)
+	}
+	if got := r.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	wantQuery := map[string][]string{"key": {"test-api-key"}}
+	for key, value := range params {
+		wantQuery[key] = []string{value}
+	}
+	if got := map[string][]string(r.URL.Query()); !reflect.DeepEqual(got, wantQuery) {
+		t.Errorf("query = %#v, want %#v", got, wantQuery)
+	}
+}
+
+func TestGetNewsForApp_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/ISteamNews/GetNewsForApp/v0002", map[string]string{"appid": "440"})
+		writeJSON(t, w, json.RawMessage(`{"appnews":{"appid":440,"newsitems":[{
+			"gid":"12345678901234567890","title":"Update","url":"https://example.com/news",
+			"is_external_url":true,"author":"Valve","contents":"Patch notes","feedlabel":"Updates",
+			"date":1700000000,"feedname":"steam_updates","feed_type":1,"appid":440
+		}],"count":1}}`))
+	}))
+	got, err := client.GetNewsForApp(context.Background(), "440")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []NewsItem{{GID: "12345678901234567890", Title: "Update", URL: "https://example.com/news",
+		IsExternalURL: true, Author: "Valve", Contents: "Patch notes", FeedLabel: "Updates",
+		Date: 1700000000, FeedName: "steam_updates", FeedType: 1, AppID: 440}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("GetNewsForApp() = %#v, want %#v", got, want)
+	}
+}
+
+func TestGetGlobalAchievementPercentagesForApp_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002", map[string]string{"gameid": "440"})
+		writeJSON(t, w, json.RawMessage(`{"achievementpercentages":{"achievements":[{"name":"WIN_ONE","percent":12.3}]}}`))
+	}))
+	got, err := client.GetGlobalAchievementPercentagesForApp(context.Background(), "440")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []GlobalAchievement{{Name: "WIN_ONE", Percent: 12.3}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("GetGlobalAchievementPercentagesForApp() = %#v, want %#v", got, want)
+	}
+}
+
+func TestPlayerSummaries_EnrichedFields(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/ISteamUser/GetPlayerSummaries/v0002", map[string]string{"steamids": "42"})
+		writeJSON(t, w, json.RawMessage(`{"response":{"players":[{
+			"steamid":"42","personaname":"Solo","avatar":"small","avatarmedium":"medium","avatarfull":"full",
+			"communityvisibilitystate":3,"profilestate":1,"lastlogoff":1700000000,"personastate":2,
+			"realname":"Alex","primaryclanid":"103582791429521412","timecreated":1600000000,
+			"personastateflags":4,"gameid":"440","gameextrainfo":"Team Fortress 2",
+			"loccountrycode":"US","locstatecode":"WA","loccityid":3961,"profileurl":"https://steamcommunity.com/id/solo/"
+		}]}}`))
+	}))
+	want := Player{SteamID: "42", PersonaName: "Solo", AvatarSmall: "small", AvatarMedium: "medium", AvatarFull: "full",
+		CommunityVisibilityState: 3, ProfileState: 1, LastLogoff: 1700000000, PersonaState: 2,
+		RealName: "Alex", PrimaryClanID: "103582791429521412", TimeCreated: 1600000000,
+		PersonaStateFlags: 4, GameID: "440", GameExtraInfo: "Team Fortress 2",
+		LocCountryCode: "US", LocStateCode: "WA", LocCityID: 3961, ProfileURL: "https://steamcommunity.com/id/solo/"}
+	players, err := client.Players(context.Background(), []string{"42"})
+	if err != nil {
+		t.Fatalf("Players() error = %v", err)
+	}
+	if !reflect.DeepEqual(players, []Player{want}) {
+		t.Errorf("Players() = %#v, want %#v", players, []Player{want})
+	}
+	player, err := client.Player(context.Background(), "42")
+	if err != nil {
+		t.Fatalf("Player() error = %v", err)
+	}
+	if player != want {
+		t.Errorf("Player() = %#v, want %#v", player, want)
+	}
+}
+
+func TestGetPlayerAchievements_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/ISteamUserStats/GetPlayerAchievements/v0001", map[string]string{"steamid": "42", "appid": "440"})
+		writeJSON(t, w, json.RawMessage(`{"playerstats":{"steamID":"42","gameName":"Team Fortress 2","achievements":[
+			{"apiname":"WIN_ONE","achieved":1,"unlocktime":1700000000,"name":"First win","description":"Win a game"},
+			{"apiname":"WIN_TWO","achieved":0,"unlocktime":0}
+		],"success":true}}`))
+	}))
+	got, err := client.GetPlayerAchievements(context.Background(), "42", "440")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []PlayerAchievement{
+		{APIName: "WIN_ONE", Achieved: 1, UnlockTime: 1700000000, Name: "First win", Description: "Win a game"},
+		{APIName: "WIN_TWO"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("GetPlayerAchievements() = %#v, want %#v", got, want)
+	}
+}
+
+func TestGetUserStatsForGame_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/ISteamUserStats/GetUserStatsForGame/v0002", map[string]string{"steamid": "42", "appid": "440"})
+		writeJSON(t, w, json.RawMessage(`{"playerstats":{"steamID":"42","gameName":"Team Fortress 2","stats":[{"name":"wins","value":17}],"achievements":[]}}`))
+	}))
+	got, err := client.GetUserStatsForGame(context.Background(), "42", "440")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []UserStat{{Name: "wins", Value: 17}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("GetUserStatsForGame() = %#v, want %#v", got, want)
+	}
+}
+
+func TestGames_EnrichedFields(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/IPlayerService/GetOwnedGames/v0001/", map[string]string{
+			"steamid": "42", "include_appinfo": "1", "include_played_free_games": "1",
+		})
+		writeJSON(t, w, json.RawMessage(`{"response":{"game_count":1,"games":[{
+			"appid":440,"name":"Team Fortress 2","playtime_forever":120,"img_icon_url":"icon","img_logo_url":"logo",
+			"playtime_2weeks":30,"has_community_visible_stats":true,"playtime_windows_forever":80,
+			"playtime_mac_forever":10,"playtime_linux_forever":30,"rtime_last_played":1700000000
+		}]}}`))
+	}))
+	got, err := client.Games(context.Background(), "42", true, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []Game{{AppID: 440, Name: "Team Fortress 2", PlaytimeForever: 120, ImgIconURL: "icon", ImgLogoURL: "logo",
+		Playtime2Weeks: 30, HasCommunityVisibleStats: true, PlaytimeWindowsForever: 80,
+		PlaytimeMacForever: 10, PlaytimeLinuxForever: 30, RTimeLastPlayed: 1700000000}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Games() = %#v, want %#v", got, want)
+	}
+}
+
+func TestGetRecentlyPlayedGames_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/IPlayerService/GetRecentlyPlayedGames/v0001", map[string]string{"steamid": "42"})
+		writeJSON(t, w, json.RawMessage(`{"response":{"total_count":1,"games":[{
+			"appid":440,"name":"Team Fortress 2","playtime_2weeks":30,"playtime_forever":120,"img_icon_url":"icon","img_logo_url":"logo"
+		}]}}`))
+	}))
+	got, err := client.GetRecentlyPlayedGames(context.Background(), "42")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []Game{{AppID: 440, Name: "Team Fortress 2", Playtime2Weeks: 30, PlaytimeForever: 120, ImgIconURL: "icon", ImgLogoURL: "logo"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("GetRecentlyPlayedGames() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSharedGames_DefaultFetchUsesOwnedGames(t *testing.T) {
+	var requests atomic.Int32
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		steamID := r.URL.Query().Get("steamid")
+		assertRequest(t, r, "/IPlayerService/GetOwnedGames/v0001/", map[string]string{
+			"steamid": steamID, "include_appinfo": "1", "include_played_free_games": "1",
+		})
+		switch steamID {
+		case "caller":
+			writeJSON(t, w, json.RawMessage(`{"response":{"games":[{"appid":1,"name":"Only caller"},{"appid":2,"name":"Shared"}]}}`))
+		case "friend":
+			writeJSON(t, w, json.RawMessage(`{"response":{"games":[{"appid":2,"name":"Shared"},{"appid":3,"name":"Only friend"}]}}`))
+		default:
+			t.Errorf("unexpected Steam ID: %q", steamID)
+			http.Error(w, "unexpected Steam ID", http.StatusBadRequest)
+		}
+	}))
+	got, err := client.SharedGames(context.Background(), "caller", "friend")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []Game{{AppID: 2, Name: "Shared"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("SharedGames() = %#v, want %#v", got, want)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("GetOwnedGames requests = %d, want 2", got)
+	}
+}
+
+func TestGames_FlagsNoExtras(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/IPlayerService/GetOwnedGames/v0001/", map[string]string{
+			"steamid": "42", "include_appinfo": "0", "include_played_free_games": "0",
+		})
+		writeJSON(t, w, json.RawMessage(`{"response":{"games":[]}}`))
+	}))
+	_, err := client.Games(context.Background(), "42", false, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGames_FlagsAppInfoOnly(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/IPlayerService/GetOwnedGames/v0001/", map[string]string{
+			"steamid": "42", "include_appinfo": "1", "include_played_free_games": "0",
+		})
+		writeJSON(t, w, json.RawMessage(`{"response":{"games":[]}}`))
+	}))
+	_, err := client.Games(context.Background(), "42", true, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGames_FlagsFreeGamesOnly(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/IPlayerService/GetOwnedGames/v0001/", map[string]string{
+			"steamid": "42", "include_appinfo": "0", "include_played_free_games": "1",
+		})
+		writeJSON(t, w, json.RawMessage(`{"response":{"games":[]}}`))
+	}))
+	_, err := client.Games(context.Background(), "42", false, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestPlayers_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.Players(context.Background(), []string{"42"})
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
+func TestPlayer_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.Player(ctx, "42")
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestPlayer_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.Player(context.Background(), "42")
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
+func TestGames_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.Games(ctx, "42", true, true)
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestGames_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.Games(context.Background(), "42", true, true)
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
+func TestFriends_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.Friends(ctx, "42")
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestFriends_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.Friends(context.Background(), "42")
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
+func TestGetNewsForApp_DecodeError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	}))
+	_, err := client.GetNewsForApp(context.Background(), "440")
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.HasPrefix(err.Error(), "steamapi: decoding response:") {
+		t.Fatalf("error = %v, want wrapped JSON syntax error", err)
+	}
+}
+
+func TestGetNewsForApp_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.GetNewsForApp(ctx, "440")
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestGetNewsForApp_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.GetNewsForApp(context.Background(), "440")
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
+func TestGetGlobalAchievementPercentagesForApp_DecodeError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	}))
+	_, err := client.GetGlobalAchievementPercentagesForApp(context.Background(), "440")
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.HasPrefix(err.Error(), "steamapi: decoding response:") {
+		t.Fatalf("error = %v, want wrapped JSON syntax error", err)
+	}
+}
+
+func TestGetGlobalAchievementPercentagesForApp_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.GetGlobalAchievementPercentagesForApp(ctx, "440")
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestGetGlobalAchievementPercentagesForApp_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.GetGlobalAchievementPercentagesForApp(context.Background(), "440")
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
+func TestGetPlayerAchievements_DecodeError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	}))
+	_, err := client.GetPlayerAchievements(context.Background(), "42", "440")
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.HasPrefix(err.Error(), "steamapi: decoding response:") {
+		t.Fatalf("error = %v, want wrapped JSON syntax error", err)
+	}
+}
+
+func TestGetPlayerAchievements_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.GetPlayerAchievements(ctx, "42", "440")
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestGetPlayerAchievements_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.GetPlayerAchievements(context.Background(), "42", "440")
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
+func TestGetUserStatsForGame_DecodeError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	}))
+	_, err := client.GetUserStatsForGame(context.Background(), "42", "440")
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.HasPrefix(err.Error(), "steamapi: decoding response:") {
+		t.Fatalf("error = %v, want wrapped JSON syntax error", err)
+	}
+}
+
+func TestGetUserStatsForGame_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.GetUserStatsForGame(ctx, "42", "440")
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestGetUserStatsForGame_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.GetUserStatsForGame(context.Background(), "42", "440")
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
+func TestGetRecentlyPlayedGames_DecodeError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	}))
+	_, err := client.GetRecentlyPlayedGames(context.Background(), "42")
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.HasPrefix(err.Error(), "steamapi: decoding response:") {
+		t.Fatalf("error = %v, want wrapped JSON syntax error", err)
+	}
+}
+
+func TestGetRecentlyPlayedGames_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.GetRecentlyPlayedGames(ctx, "42")
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestGetRecentlyPlayedGames_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.GetRecentlyPlayedGames(context.Background(), "42")
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
+func TestSharedGames_DecodeError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	}))
+	_, err := client.SharedGames(context.Background(), "42")
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.HasPrefix(err.Error(), "steamapi: decoding response:") {
+		t.Fatalf("error = %v, want wrapped JSON syntax error", err)
+	}
+}
+
+func TestSharedGames_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.SharedGames(ctx, "42")
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestSharedGames_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.SharedGames(context.Background(), "42")
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
 	}
 }
