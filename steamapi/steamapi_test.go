@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestSharedGamesWithOneOtherIDReturnsSharedGames(t *testing.T) {
@@ -202,6 +203,195 @@ func TestSharedGamesExcludesGamesOwnedByOnlySubset(t *testing.T) {
 		if game.AppID == 1 {
 			t.Fatalf("SharedGames() included subset-only game %#v", game)
 		}
+	}
+}
+
+func TestSharedGamesFetchesConcurrently(t *testing.T) {
+	steamIDs := []string{"caller", "friend1", "friend2"}
+	entered := make(chan string, len(steamIDs))
+	released := make(chan struct{})
+	abort := make(chan struct{})
+	defer close(abort)
+	want := []Game{{AppID: 1, Name: "Shared"}}
+	client := &Client{gamesFn: func(_ context.Context, steamID string) ([]Game, error) {
+		entered <- steamID
+		select {
+		case <-released:
+			return want, nil
+		case <-abort:
+			return nil, errors.New("test stopped")
+		}
+	}}
+
+	var got []Game
+	var err error
+	done := make(chan struct{})
+	go func() {
+		got, err = client.SharedGames(context.Background(), steamIDs[0], steamIDs[1:]...)
+		close(done)
+	}()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	seen := make(map[string]bool)
+	for range steamIDs {
+		select {
+		case steamID := <-entered:
+			if seen[steamID] {
+				t.Fatalf("fetch entered twice for %q", steamID)
+			}
+			seen[steamID] = true
+		case <-timer.C:
+			t.Fatal("not all fetches entered the barrier; SharedGames may be fetching serially")
+		}
+	}
+	for _, steamID := range steamIDs {
+		if !seen[steamID] {
+			t.Fatalf("fetch never entered for %q", steamID)
+		}
+	}
+	close(released)
+
+	select {
+	case <-done:
+		if err != nil {
+			t.Fatalf("SharedGames() error = %v, want nil", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("SharedGames() = %#v, want %#v", got, want)
+		}
+	case <-timer.C:
+		t.Fatal("SharedGames did not finish after releasing the barrier")
+	}
+}
+
+func TestSharedGamesWritesResultsByIndexNotCompletionOrder(t *testing.T) {
+	tests := []struct {
+		name           string
+		gamesBySteamID map[string][]Game
+		want           []Game
+		wantEmptyIDs   []string
+	}{
+		{
+			name: "intersection follows caller order and uses caller metadata",
+			gamesBySteamID: map[string][]Game{
+				"caller":  {{AppID: 1}, {AppID: 2, Name: "Caller Two"}, {AppID: 3, Name: "Caller Three"}},
+				"friend1": {{AppID: 3}, {AppID: 2}, {AppID: 4}},
+				"friend2": {{AppID: 3}, {AppID: 2}, {AppID: 5}},
+			},
+			want: []Game{{AppID: 2, Name: "Caller Two"}, {AppID: 3, Name: "Caller Three"}},
+		},
+		{
+			name: "empty users follow caller order",
+			gamesBySteamID: map[string][]Game{
+				"caller":  {},
+				"friend1": {},
+				"friend2": {{AppID: 2}},
+			},
+			wantEmptyIDs: []string{"caller", "friend1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			friend1Done := make(chan struct{})
+			friend2Done := make(chan struct{})
+			abort := make(chan struct{})
+			defer close(abort)
+			client := &Client{gamesFn: func(_ context.Context, steamID string) ([]Game, error) {
+				// Hold the caller until both friends have reached their returns,
+				// and hold friend1 until friend2 reaches its return.
+				switch steamID {
+				case "caller":
+					select {
+					case <-friend1Done:
+					case <-abort:
+						return nil, errors.New("test stopped")
+					}
+				case "friend1":
+					defer close(friend1Done)
+					select {
+					case <-friend2Done:
+					case <-abort:
+						return nil, errors.New("test stopped")
+					}
+				case "friend2":
+					defer close(friend2Done)
+				}
+				return tt.gamesBySteamID[steamID], nil
+			}}
+
+			var got []Game
+			var err error
+			done := make(chan struct{})
+			go func() {
+				got, err = client.SharedGames(context.Background(), "caller", "friend1", "friend2")
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("SharedGames did not complete the reverse-order fetches")
+			}
+			if tt.wantEmptyIDs != nil {
+				var noGamesErr *NoGamesError
+				if !errors.As(err, &noGamesErr) {
+					t.Fatalf("SharedGames() error = %v, want NoGamesError", err)
+				}
+				if !reflect.DeepEqual(noGamesErr.SteamIDs, tt.wantEmptyIDs) {
+					t.Fatalf("NoGamesError.SteamIDs = %#v, want %#v", noGamesErr.SteamIDs, tt.wantEmptyIDs)
+				}
+			} else if err != nil {
+				t.Fatalf("SharedGames() error = %v, want nil", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("SharedGames() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSharedGamesCancelsSiblingsOnError(t *testing.T) {
+	transportErr := errors.New("transport failed")
+	canceled := make(chan struct{})
+	abort := make(chan struct{})
+	defer close(abort)
+	client := &Client{gamesFn: func(ctx context.Context, steamID string) ([]Game, error) {
+		if steamID == "error-friend" {
+			return nil, transportErr
+		}
+		select {
+		case <-ctx.Done():
+			close(canceled)
+			return nil, ctx.Err()
+		case <-abort:
+			return nil, errors.New("test stopped")
+		}
+	}}
+
+	var games []Game
+	var err error
+	done := make(chan struct{})
+	go func() {
+		games, err = client.SharedGames(context.Background(), "caller", "error-friend")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if !errors.Is(err, transportErr) || err != transportErr {
+			t.Fatalf("SharedGames() error = %v, want exact underlying error %v", err, transportErr)
+		}
+		if games != nil {
+			t.Fatalf("SharedGames() games = %#v, want nil on error", games)
+		}
+		select {
+		case <-canceled:
+		default:
+			t.Fatal("sibling did not observe context cancellation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SharedGames did not cancel and wait for the blocking sibling")
 	}
 }
 
