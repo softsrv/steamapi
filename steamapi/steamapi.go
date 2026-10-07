@@ -332,6 +332,16 @@ type PlayerStatsResult struct {
 	PlayerStats PlayerStats `json:"playerstats"`
 }
 
+// CurrentPlayerCount contains the live player count for an app.
+type CurrentPlayerCount struct {
+	PlayerCount int `json:"player_count"`
+}
+
+// CurrentPlayerCountResult contains the GetNumberOfCurrentPlayers response envelope.
+type CurrentPlayerCountResult struct {
+	Response CurrentPlayerCount `json:"response"`
+}
+
 // GetNewsForApp returns the news items for an app.
 func (s *Client) GetNewsForApp(ctx context.Context, appid string) ([]NewsItem, error) {
 	result, err := doGet[NewsResult](ctx, s, newsService, "GetNewsForApp/v0002", url.Values{
@@ -372,4 +382,12 @@ func (s *Client) GetRecentlyPlayedGames(ctx context.Context, steamID string) ([]
 		"steamid": {steamID},
 	})
 	return result.Response.Games, err
+}
+
+// GetNumberOfCurrentPlayers returns the live number of current players for an app.
+func (s *Client) GetNumberOfCurrentPlayers(ctx context.Context, appid string) (int, error) {
+	result, err := doGet[CurrentPlayerCountResult](ctx, s, playerService, "GetNumberOfCurrentPlayers/v0001", url.Values{
+		"appid": {appid},
+	})
+	return result.Response.PlayerCount, err
 }

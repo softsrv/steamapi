@@ -1149,6 +1149,54 @@ func TestGetRecentlyPlayedGames_RequestBuildError(t *testing.T) {
 	}
 }
 
+func TestGetNumberOfCurrentPlayers_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertRequest(t, r, "/IPlayerService/GetNumberOfCurrentPlayers/v0001", map[string]string{"appid": "440"})
+		writeJSON(t, w, json.RawMessage(`{"response":{"player_count":12345,"result":1}}`))
+	}))
+	got, err := client.GetNumberOfCurrentPlayers(context.Background(), "440")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != 12345 {
+		t.Errorf("GetNumberOfCurrentPlayers() = %d, want %d", got, 12345)
+	}
+}
+
+func TestGetNumberOfCurrentPlayers_DecodeError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	}))
+	_, err := client.GetNumberOfCurrentPlayers(context.Background(), "440")
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.HasPrefix(err.Error(), "steamapi: decoding response:") {
+		t.Fatalf("error = %v, want wrapped JSON syntax error", err)
+	}
+}
+
+func TestGetNumberOfCurrentPlayers_ContextCanceled(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("canceled request must not reach the server")
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.GetNumberOfCurrentPlayers(ctx, "440")
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "steamapi: performing request:") {
+		t.Fatalf("error = %v, want wrapped context cancellation", err)
+	}
+}
+
+func TestGetNumberOfCurrentPlayers_RequestBuildError(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid request URL must not reach the server")
+	}))
+	baseURL = "://invalid"
+	_, err := client.GetNumberOfCurrentPlayers(context.Background(), "440")
+	if err == nil || !strings.HasPrefix(err.Error(), "steamapi: building request:") {
+		t.Fatalf("error = %v, want request-building error", err)
+	}
+}
+
 func TestSharedGames_DecodeError(t *testing.T) {
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("not json"))
