@@ -14,6 +14,9 @@ import (
 // baseURL is a var (not const) so tests can point it at a mock server.
 var baseURL = "https://api.steampowered.com"
 
+// storeBaseURL is separate from the Web API host and can be replaced in tests.
+var storeBaseURL = "https://store.steampowered.com"
+
 const userService = "ISteamUser"
 const playerService = "IPlayerService"
 const newsService = "ISteamNews"
@@ -96,9 +99,10 @@ type FriendsResult struct {
 
 // Client is the type that owns methods for fetching steam data
 type Client struct {
-	client  *http.Client
-	apiKey  string
-	gamesFn func(ctx context.Context, steamID string) ([]Game, error)
+	client       *http.Client
+	apiKey       string
+	gamesFn      func(ctx context.Context, steamID string) ([]Game, error)
+	categoriesFn func(ctx context.Context, appID int) ([]string, error)
 }
 
 // NoGamesError is returned when one or more users have no owned games.
@@ -181,7 +185,65 @@ func (s *Client) Games(ctx context.Context, steamID string, includeAppInfo, incl
 	return result.Response.Games, err
 }
 
-// SharedGames returns the games owned by every provided Steam ID.
+type appCategory struct {
+	ID          int    `json:"id"`
+	Description string `json:"description"`
+}
+
+type appDetailsData struct {
+	Categories []appCategory `json:"categories"`
+}
+
+type appDetailsResult struct {
+	Success bool           `json:"success"`
+	Data    appDetailsData `json:"data"`
+}
+
+// categories fetches category descriptions from the Store's app-ID-keyed envelope.
+func (s *Client) categories(ctx context.Context, appID int) ([]string, error) {
+	reqURL := fmt.Sprintf("%s/api/appdetails?appids=%d", storeBaseURL, appID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("steamapi: building request: %w", err)
+	}
+	res, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("steamapi: performing request: %w", err)
+	}
+	defer res.Body.Close()
+	var out map[string]appDetailsResult
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("steamapi: decoding response: %w", err)
+	}
+	details := out[fmt.Sprint(appID)]
+	if !details.Success {
+		return nil, nil
+	}
+	categories := make([]string, 0, len(details.Data.Categories))
+	for _, category := range details.Data.Categories {
+		categories = append(categories, category.Description)
+	}
+	return categories, nil
+}
+
+func isMultiplayer(categories []string) bool {
+	multiplayerCategories := map[string]struct{}{
+		"Multi-player":        {},
+		"Co-op":               {},
+		"Online Co-op":        {},
+		"PvP":                 {},
+		"Online PvP":          {},
+		"Shared/Split Screen": {},
+	}
+	for _, category := range categories {
+		if _, ok := multiplayerCategories[category]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// SharedGames returns multiplayer-family games owned by every provided Steam ID.
 func (s *Client) SharedGames(ctx context.Context, callerID string, otherIDs ...string) ([]Game, error) {
 	steamIDs := append([]string{callerID}, otherIDs...)
 
@@ -248,7 +310,21 @@ func (s *Client) SharedGames(ctx context.Context, callerID string, otherIDs ...s
 		}
 	}
 
-	return sharedGames, nil
+	fetchCategories := s.categoriesFn
+	if fetchCategories == nil {
+		fetchCategories = s.categories
+	}
+	multiplayerGames := make([]Game, 0, len(sharedGames))
+	for _, game := range sharedGames {
+		categories, err := fetchCategories(ctx, game.AppID)
+		if err != nil {
+			return nil, err
+		}
+		if isMultiplayer(categories) {
+			multiplayerGames = append(multiplayerGames, game)
+		}
+	}
+	return multiplayerGames, nil
 }
 
 // Friends returns the raw friend list without fetching player summaries.
