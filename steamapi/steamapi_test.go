@@ -1510,3 +1510,446 @@ func TestSharedGames_RequestBuildError(t *testing.T) {
 		t.Fatalf("error = %v, want request-building error", err)
 	}
 }
+
+func TestSharedAppIDsReturnsStrictIntersectionInCallerOrder(t *testing.T) {
+	client := &Client{gamesFn: stubGames(t, map[string][]Game{
+		"caller":  {{AppID: 1}, {AppID: 3}, {AppID: 2}},
+		"friend1": {{AppID: 2}, {AppID: 1}, {AppID: 3}, {AppID: 3}},
+		"friend2": {{AppID: 2}, {AppID: 3}, {AppID: 4}},
+	}, nil)}
+	got, err := client.SharedAppIDs(context.Background(), "caller", "friend1", "friend2")
+	if err != nil {
+		t.Fatalf("SharedAppIDs() error = %v, want nil", err)
+	}
+	if want := []int{3, 2}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("SharedAppIDs() = %#v, want strict intersection %#v", got, want)
+	}
+}
+
+func TestSharedAppIDsNeverFetchesCategories(t *testing.T) {
+	client := NewClient("")
+	client.gamesFn = stubGames(t, map[string][]Game{
+		"caller": {{AppID: 42}}, "friend": {{AppID: 42}},
+	}, nil)
+	client.categoriesFn = func(context.Context, int) ([]string, error) {
+		t.Error("SharedAppIDs must not fetch categories")
+		return nil, errors.New("unexpected categories call")
+	}
+	client.client.Transport = categoryTransport(func(*http.Request) (*http.Response, error) {
+		t.Error("SharedAppIDs must not make Store requests")
+		return nil, errors.New("unexpected Store request")
+	})
+	got, err := client.SharedAppIDs(context.Background(), "caller", "friend")
+	if err != nil || !reflect.DeepEqual(got, []int{42}) {
+		t.Fatalf("SharedAppIDs() = %#v, %v; want [42], nil", got, err)
+	}
+}
+
+func TestSharedAppIDsFetchesConcurrently(t *testing.T) {
+	steamIDs := []string{"caller", "friend1", "friend2"}
+	entered := make(chan string, len(steamIDs))
+	released := make(chan struct{})
+	abort := make(chan struct{})
+	defer close(abort)
+	client := &Client{gamesFn: func(_ context.Context, steamID string) ([]Game, error) {
+		entered <- steamID
+		select {
+		case <-released:
+			return []Game{{AppID: 1}}, nil
+		case <-abort:
+			return nil, errors.New("test stopped")
+		}
+	}}
+
+	var got []int
+	var err error
+	done := make(chan struct{})
+	go func() {
+		got, err = client.SharedAppIDs(context.Background(), steamIDs[0], steamIDs[1:]...)
+		close(done)
+	}()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	seen := make(map[string]bool)
+	for range steamIDs {
+		select {
+		case steamID := <-entered:
+			if seen[steamID] {
+				t.Fatalf("fetch entered twice for %q", steamID)
+			}
+			seen[steamID] = true
+		case <-timer.C:
+			t.Fatal("not all fetches entered the barrier; SharedAppIDs may be fetching serially")
+		}
+	}
+	for _, steamID := range steamIDs {
+		if !seen[steamID] {
+			t.Fatalf("fetch never entered for %q", steamID)
+		}
+	}
+	close(released)
+
+	select {
+	case <-done:
+		if err != nil {
+			t.Fatalf("SharedAppIDs() error = %v, want nil", err)
+		}
+		if want := []int{1}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("SharedAppIDs() = %#v, want %#v", got, want)
+		}
+	case <-timer.C:
+		t.Fatal("SharedAppIDs did not finish after releasing the barrier")
+	}
+}
+
+func TestSharedAppIDsNoGamesErrorNamesEmptyMembersInCallerOrder(t *testing.T) {
+	client := &Client{gamesFn: stubGames(t, map[string][]Game{
+		"caller": {}, "friend1": {{AppID: 1}}, "friend2": {},
+	}, nil)}
+	got, err := client.SharedAppIDs(context.Background(), "caller", "friend1", "friend2")
+	if got != nil {
+		t.Fatalf("SharedAppIDs() = %#v, want nil", got)
+	}
+	var noGamesErr *NoGamesError
+	if !errors.As(err, &noGamesErr) {
+		t.Fatalf("SharedAppIDs() error = %v, want NoGamesError", err)
+	}
+	if want := []string{"caller", "friend2"}; !reflect.DeepEqual(noGamesErr.SteamIDs, want) {
+		t.Fatalf("NoGamesError.SteamIDs = %#v, want %#v", noGamesErr.SteamIDs, want)
+	}
+}
+
+func TestGamesDetailsReturnsOneEntryPerRequestedAppID(t *testing.T) {
+	appIDs := []int{10, 3, 8, 2, 9, 4, 7, 1, 6, 5}
+	categories := make(map[int][]string)
+	want := make([]GameDetail, len(appIDs))
+	for i, appID := range appIDs {
+		categories[appID] = []string{"Single-player"}
+		want[i] = GameDetail{AppID: appID, Multiplayer: false}
+	}
+	client := &Client{categoriesFn: stubCategories(t, categories, nil)}
+	got, err := client.GamesDetails(context.Background(), appIDs)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("GamesDetails() = %#v, %v; want %#v, nil", got, err, want)
+	}
+}
+
+func TestGamesDetailsMultiplayerCategoryMembership(t *testing.T) {
+	client := &Client{categoriesFn: stubCategories(t, map[int][]string{
+		1:  {"Single-player", "Multi-player"},
+		2:  {"Co-op"},
+		3:  {"Online Co-op"},
+		4:  {"PvP"},
+		5:  {"Online PvP"},
+		6:  {"Shared/Split Screen"},
+		7:  {"Single-player"},
+		8:  nil,
+		9:  {"multi-player"},
+		10: {"Local Co-op", "Shared/Split Screen Co-op"},
+	}, nil)}
+	got, err := client.GamesDetails(context.Background(), []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	want := []GameDetail{
+		{AppID: 1, Multiplayer: true},
+		{AppID: 2, Multiplayer: true},
+		{AppID: 3, Multiplayer: true},
+		{AppID: 4, Multiplayer: true},
+		{AppID: 5, Multiplayer: true},
+		{AppID: 6, Multiplayer: true},
+		{AppID: 7, Multiplayer: false},
+		{AppID: 8, Multiplayer: false},
+		{AppID: 9, Multiplayer: false},
+		{AppID: 10, Multiplayer: false},
+	}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("GamesDetails() = %#v, %v; want %#v, nil", got, err, want)
+	}
+}
+
+func TestGamesDetailsFetchesConcurrently(t *testing.T) {
+	appIDs := []int{3, 1, 2}
+	entered := make(chan int, len(appIDs))
+	released := make(chan struct{})
+	abort := make(chan struct{})
+	defer close(abort)
+	client := &Client{categoriesFn: func(_ context.Context, appID int) ([]string, error) {
+		entered <- appID
+		select {
+		case <-released:
+			return []string{"Co-op"}, nil
+		case <-abort:
+			return nil, errors.New("test stopped")
+		}
+	}}
+
+	var got []GameDetail
+	var err error
+	done := make(chan struct{})
+	go func() {
+		got, err = client.GamesDetails(context.Background(), appIDs)
+		close(done)
+	}()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	seen := make(map[int]bool)
+	for range appIDs {
+		select {
+		case appID := <-entered:
+			if seen[appID] {
+				t.Fatalf("lookup entered twice for %d", appID)
+			}
+			seen[appID] = true
+		case <-timer.C:
+			t.Fatal("not all lookups entered the barrier; GamesDetails may be fetching serially")
+		}
+	}
+	for _, appID := range appIDs {
+		if !seen[appID] {
+			t.Fatalf("lookup never entered for %d", appID)
+		}
+	}
+	close(released)
+
+	select {
+	case <-done:
+		want := []GameDetail{{AppID: 3, Multiplayer: true}, {AppID: 1, Multiplayer: true}, {AppID: 2, Multiplayer: true}}
+		if err != nil || !reflect.DeepEqual(got, want) {
+			t.Fatalf("GamesDetails() = %#v, %v; want %#v, nil", got, err, want)
+		}
+	case <-timer.C:
+		t.Fatal("GamesDetails did not finish after releasing the barrier")
+	}
+}
+
+func TestGamesDetailsRejectsMoreThanTenWithoutLookups(t *testing.T) {
+	client := NewClient("")
+	client.categoriesFn = func(context.Context, int) ([]string, error) {
+		t.Error("GamesDetails must reject more than 10 app IDs before fetching categories")
+		return nil, errors.New("unexpected categories call")
+	}
+	client.client.Transport = categoryTransport(func(*http.Request) (*http.Response, error) {
+		t.Error("GamesDetails must reject more than 10 app IDs before Store requests")
+		return nil, errors.New("unexpected Store request")
+	})
+	got, err := client.GamesDetails(context.Background(), []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
+	if err == nil || got != nil {
+		t.Fatalf("GamesDetails() = %#v, %v; want nil, non-nil error", got, err)
+	}
+}
+
+func TestSharedAppIDsComposesWithGamesDetails(t *testing.T) {
+	client := &Client{
+		gamesFn: stubGames(t, map[string][]Game{
+			"caller":  {{AppID: 1}, {AppID: 3}, {AppID: 2}},
+			"friend1": {{AppID: 2}, {AppID: 1}, {AppID: 3}},
+			"friend2": {{AppID: 2}, {AppID: 3}},
+		}, nil),
+		categoriesFn: stubCategories(t, map[int][]string{
+			3: {"Single-player"}, 2: {"Co-op"},
+		}, nil),
+	}
+	appIDs, err := client.SharedAppIDs(context.Background(), "caller", "friend1", "friend2")
+	if err != nil {
+		t.Fatalf("SharedAppIDs() error = %v, want nil", err)
+	}
+	got, err := client.GamesDetails(context.Background(), appIDs)
+	want := []GameDetail{{AppID: 3, Multiplayer: false}, {AppID: 2, Multiplayer: true}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("GamesDetails(SharedAppIDs()) = %#v, %v; want %#v, nil", got, err, want)
+	}
+}
+
+func TestSharedAppIDsNoIntersectionReturnsNonNilEmptySlice(t *testing.T) {
+	client := &Client{gamesFn: stubGames(t, map[string][]Game{
+		"caller": {{AppID: 1}}, "friend": {{AppID: 2}},
+	}, nil)}
+	got, err := client.SharedAppIDs(context.Background(), "caller", "friend")
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("SharedAppIDs() = %#v, %v; want non-nil empty slice, nil", got, err)
+	}
+}
+
+func TestGamesDetailsEmptyInputSkipsLookups(t *testing.T) {
+	client := &Client{categoriesFn: func(context.Context, int) ([]string, error) {
+		t.Error("empty input must not fetch categories")
+		return nil, errors.New("unexpected categories call")
+	}}
+	got, err := client.GamesDetails(context.Background(), nil)
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("GamesDetails() = %#v, %v; want non-nil empty slice, nil", got, err)
+	}
+}
+
+func TestGamesDetailsPropagatesCategoryErrorWithoutPartialResult(t *testing.T) {
+	categoryErr := errors.New("category lookup failed")
+	client := &Client{categoriesFn: stubCategories(t, map[int][]string{
+		1: {"Co-op"},
+	}, map[int]error{2: categoryErr})}
+	got, err := client.GamesDetails(context.Background(), []int{1, 2})
+	if err != categoryErr || got != nil {
+		t.Fatalf("GamesDetails() = %#v, %v; want nil, exact category error", got, err)
+	}
+}
+
+func TestSharedAppIDsCancelsSiblingsOnError(t *testing.T) {
+	transportErr := errors.New("transport failed")
+	canceled := make(chan struct{})
+	abort := make(chan struct{})
+	defer close(abort)
+	client := &Client{gamesFn: func(ctx context.Context, steamID string) ([]Game, error) {
+		if steamID == "error-friend" {
+			return nil, transportErr
+		}
+		select {
+		case <-ctx.Done():
+			close(canceled)
+			return nil, ctx.Err()
+		case <-abort:
+			return nil, errors.New("test stopped")
+		}
+	}}
+
+	var games []int
+	var err error
+	done := make(chan struct{})
+	go func() {
+		games, err = client.SharedAppIDs(context.Background(), "caller", "error-friend")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if !errors.Is(err, transportErr) || err != transportErr {
+			t.Fatalf("SharedAppIDs() error = %v, want exact underlying error %v", err, transportErr)
+		}
+		if games != nil {
+			t.Fatalf("SharedAppIDs() games = %#v, want nil on error", games)
+		}
+		select {
+		case <-canceled:
+		default:
+			t.Fatal("sibling did not observe context cancellation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SharedAppIDs did not cancel and wait for the blocking sibling")
+	}
+}
+
+func TestGamesDetailsCancelsSiblingsOnError(t *testing.T) {
+	transportErr := errors.New("transport failed")
+	canceled := make(chan struct{})
+	abort := make(chan struct{})
+	defer close(abort)
+	client := &Client{categoriesFn: func(ctx context.Context, appID int) ([]string, error) {
+		if appID == 2 {
+			return nil, transportErr
+		}
+		select {
+		case <-ctx.Done():
+			close(canceled)
+			return nil, ctx.Err()
+		case <-abort:
+			return nil, errors.New("test stopped")
+		}
+	}}
+
+	var games []GameDetail
+	var err error
+	done := make(chan struct{})
+	go func() {
+		games, err = client.GamesDetails(context.Background(), []int{1, 2})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if !errors.Is(err, transportErr) || err != transportErr {
+			t.Fatalf("GamesDetails() error = %v, want exact underlying error %v", err, transportErr)
+		}
+		if games != nil {
+			t.Fatalf("GamesDetails() games = %#v, want nil on error", games)
+		}
+		select {
+		case <-canceled:
+		default:
+			t.Fatal("sibling did not observe context cancellation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GamesDetails did not cancel and wait for the blocking sibling")
+	}
+}
+
+func TestSharedAppIDsDefaultFetchUsesOwnedGames(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "owned games context")
+	var requests atomic.Int32
+	client := NewClient("test-api-key")
+	client.client.Transport = categoryTransport(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		steamID := req.URL.Query().Get("steamid")
+		assertRequest(t, req, "/IPlayerService/GetOwnedGames/v0001/", map[string]string{
+			"steamid": steamID, "include_appinfo": "1", "include_played_free_games": "1",
+		})
+		if req.Context().Value(contextKey{}) != "owned games context" {
+			t.Error("owned games request lost caller context")
+		}
+		var body string
+		switch steamID {
+		case "caller":
+			body = `{"response":{"games":[{"appid":1},{"appid":3},{"appid":2}]}}`
+		case "friend":
+			body = `{"response":{"games":[{"appid":2},{"appid":3}]}}`
+		default:
+			t.Errorf("unexpected Steam ID %q", steamID)
+			return nil, errors.New("unexpected Steam ID")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	got, err := client.SharedAppIDs(ctx, "caller", "friend")
+	if err != nil || !reflect.DeepEqual(got, []int{3, 2}) {
+		t.Fatalf("SharedAppIDs() = %#v, %v; want [3 2], nil", got, err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("GetOwnedGames requests = %d, want 2", got)
+	}
+}
+
+func TestGamesDetailsDefaultCategoriesUsesStore(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "category context")
+	var requests atomic.Int32
+	client := NewClient("must-not-be-sent-to-store")
+	client.client.Transport = categoryTransport(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		if req.Method != http.MethodGet || req.URL.Scheme != "https" || req.URL.Host != "store.steampowered.com" || req.URL.Path != "/api/appdetails" {
+			t.Errorf("unexpected Store request: %s %s", req.Method, req.URL)
+		}
+		if req.Context().Value(contextKey{}) != "category context" {
+			t.Error("Store request lost caller context")
+		}
+		appID := req.URL.Query().Get("appids")
+		if want := map[string][]string{"appids": {appID}}; !reflect.DeepEqual(map[string][]string(req.URL.Query()), want) {
+			t.Errorf("unexpected Store query: %v", req.URL.Query())
+		}
+		var body string
+		switch appID {
+		case "42":
+			body = `{"42":{"success":true,"data":{"categories":[{"id":9,"description":"Co-op"}]}}}`
+		case "43":
+			body = `{"43":{"success":true,"data":{"categories":[{"id":2,"description":"Single-player"}]}}}`
+		default:
+			t.Errorf("unexpected Store app ID %q", appID)
+			return nil, errors.New("unexpected Store app ID")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	got, err := client.GamesDetails(ctx, []int{43, 42})
+	want := []GameDetail{{AppID: 43, Multiplayer: false}, {AppID: 42, Multiplayer: true}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("GamesDetails() = %#v, %v; want %#v, nil", got, err, want)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("Store requests = %d, want 2", got)
+	}
+}

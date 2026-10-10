@@ -327,6 +327,121 @@ func (s *Client) SharedGames(ctx context.Context, callerID string, otherIDs ...s
 	return multiplayerGames, nil
 }
 
+// SharedAppIDs returns app IDs owned by every provided Steam ID in caller order.
+func (s *Client) SharedAppIDs(ctx context.Context, callerID string, otherIDs ...string) ([]int, error) {
+	steamIDs := append([]string{callerID}, otherIDs...)
+
+	gamesByUser := make([][]Game, len(steamIDs))
+	fetchGames := s.gamesFn
+	if fetchGames == nil {
+		fetchGames = func(ctx context.Context, steamID string) ([]Game, error) {
+			return s.Games(ctx, steamID, true, true)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	for i, steamID := range steamIDs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			games, err := fetchGames(ctx, steamID)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			gamesByUser[i] = games
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	var emptySteamIDs []string
+	for i, games := range gamesByUser {
+		if len(games) == 0 {
+			emptySteamIDs = append(emptySteamIDs, steamIDs[i])
+		}
+	}
+	if len(emptySteamIDs) > 0 {
+		return nil, &NoGamesError{SteamIDs: emptySteamIDs}
+	}
+
+	ownedCounts := make(map[int]int)
+	for _, games := range gamesByUser {
+		seen := make(map[int]bool)
+		for _, game := range games {
+			if seen[game.AppID] {
+				continue
+			}
+			seen[game.AppID] = true
+			ownedCounts[game.AppID]++
+		}
+	}
+
+	sharedAppIDs := make([]int, 0)
+	for _, game := range gamesByUser[0] {
+		if ownedCounts[game.AppID] == len(gamesByUser) {
+			sharedAppIDs = append(sharedAppIDs, game.AppID)
+		}
+	}
+	return sharedAppIDs, nil
+}
+
+// GameDetail contains an app's multiplayer-family classification.
+type GameDetail struct {
+	AppID       int
+	Multiplayer bool
+}
+
+// GamesDetails returns details for up to 10 app IDs in request order.
+func (s *Client) GamesDetails(ctx context.Context, appIDs []int) ([]GameDetail, error) {
+	if len(appIDs) > 10 {
+		return nil, fmt.Errorf("steamapi: game details accepts at most 10 app IDs")
+	}
+
+	fetchCategories := s.categoriesFn
+	if fetchCategories == nil {
+		fetchCategories = s.categories
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	details := make([]GameDetail, len(appIDs))
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	for i, appID := range appIDs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			categories, err := fetchCategories(ctx, appID)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			details[i] = GameDetail{AppID: appID, Multiplayer: isMultiplayer(categories)}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return details, nil
+}
+
 // Friends returns the raw friend list without fetching player summaries.
 func (s *Client) Friends(ctx context.Context, steamID string) ([]Friend, error) {
 	result, err := doGet[FriendsResult](ctx, s, userService, "GetFriendList/v0001/", url.Values{
