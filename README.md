@@ -35,4 +35,58 @@ steamapi v1.0.0 supports a subset of the Steam Web API:
 - `GetUserStatsForGame` — ISteamUserStats/GetUserStatsForGame stats for a player and game.
 - `GetRecentlyPlayedGames` — IPlayerService/GetRecentlyPlayedGames recently played games for a player.
 
-The v1.0.0 release includes breaking changes: `Friends` now returns `[]Friend`, and the `Games` signature/options have changed. These changes ship under the new major version v1.0.0, not a retag of v0.1.0. Cutting the actual git tag and publishing the GitHub release are post-merge human steps.
+The v1.0.0 release includes breaking changes: `Friends` now returns `[]Friend`, and the `Games` signature/options have changed. These changes ship under the new major version v1.0.0, not a retag of v0.1.0. Tags and GitHub releases are now published automatically after the main-branch release gate succeeds.
+
+## Release automation
+
+On pushes to `main`, the Release workflow runs build, vet, and tests before its
+`release` job can run. That job reads the latest reachable tag and all full commit
+messages since it. Breaking headers (`feat!:`, `fix(api)!:`, etc.) or
+`BREAKING CHANGE:` / `BREAKING-CHANGE:` footer lines bump major; otherwise `feat`
+bumps minor, then `fix` bumps patch. If no significance is recognizable, the
+fallback is **minor**, including chore/docs-only and legacy messages. Major and
+minor bumps reset the lower components. Tags must be stable `vMAJOR.MINOR.PATCH`
+versions; this tooling adds no version file or module dependencies.
+
+Publication is serialized. An already-tagged commit is skipped before computing
+another version, and an existing computed tag skips both tag creation and release
+publication. `gh release create` creates the missing tag at the workflow's exact
+commit and publishes its GitHub release using `GITHUB_TOKEN`. If publication fails
+after creating a tag, retries intentionally do not repair that release: maintainers
+must inspect and recover it manually rather than bypass the existing-tag guard.
+
+The Commit lint workflow validates every commit in a PR to `main`, not just its
+title. Use `type(optional-scope)optional-!: description`, with one of `feat`, `fix`,
+`docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, or `revert`.
+For example, `feat(steamapi): add method` is valid; `Add method` is not. Repository
+administrators must make **Validate PR commits** a required check in the `main`
+branch ruleset to block merging; workflow files alone cannot configure that rule.
+
+Both workflows call stdlib-only Go tooling. Its stdin protocol is **NUL-separated
+full commit messages**, with an optional final NUL (newlines stay inside messages):
+
+```sh
+git log -z --format=%B v1.0.2..HEAD | go run ./cmd/release-tool next-version v1.0.2
+git log -z --format=%B origin/main..HEAD | go run ./cmd/release-tool validate-commits
+```
+
+`next-version` prints the version; `validate-commits` prints quoted invalid messages
+and exits nonzero if any fail. Invalid arguments and unreadable input also fail.
+
+### Deferred live verification
+
+Go tests cover version computation, validation, CLI framing, and a static check of
+the release gate. Live Actions evidence remains deferred for CLM-2/5/6/7. In an
+authorized disposable GitHub repository, verify these scenarios before treating
+those runtime guarantees as proven:
+
+- **CLM-2:** push a deliberate build, vet, or test failure to main; check that the
+  release job is skipped and the before/after tag and release lists are identical.
+- **CLM-5:** push a valid feature commit; check that its gate succeeds, the expected
+  next tag points at the triggering SHA, and a GitHub release exists for that tag.
+- **CLM-6:** rerun that successful workflow, then separately pre-create the computed
+  tag on another commit and trigger publication; both cases must leave the tag and
+  release lists unchanged.
+- **CLM-7:** open a PR containing both a valid commit and `change case`; verify
+  **Validate PR commits** fails and the configured branch ruleset blocks merging.
+  Rewrite the malformed message to `fix: change case` and verify the check succeeds.
