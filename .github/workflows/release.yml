@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          check-latest: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./... -v -race -cover
+
+  release:
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Serialize publishers so two runs cannot race the existing-tag guard.
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+    steps:
+      - name: Check out full tag history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          check-latest: true
+      - name: Compute version, guard existing tags, and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A re-run must not compute a fresh minor bump from an empty range.
+          if git describe --tags --exact-match --match 'v[0-9]*' "$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "This commit is already tagged; skipping tag and release publication."
+            exit 0
+          fi
+
+          LAST_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$GITHUB_SHA")
+          # -z keeps full multiline bodies and breaking-change footers intact.
+          VERSION=$(git log -z --format=%B "$LAST_TAG..$GITHUB_SHA" | go run ./cmd/release-tool next-version "$LAST_TAG")
+
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "Tag $VERSION already exists; skipping tag and release publication."
+            exit 0
+          fi
+
+          # gh creates the missing git tag at this exact SHA and publishes its release.
+          gh release create "$VERSION" --target "$GITHUB_SHA" --title "$VERSION" --generate-notes
