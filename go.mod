@@ -1,3 +1,3 @@
 module github.com/softsrv/steamapi
 
-go 1.22.3
+go 1.27.2
